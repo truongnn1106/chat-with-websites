@@ -1,7 +1,6 @@
-# pip install streamlit langchain lanchain-openai beautifulsoup4 python-dotenv chromadb
-
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 import os
-import streamlit as st
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_community.document_loaders import WebBaseLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -12,30 +11,38 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.chains import create_history_aware_retriever, create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 
-
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
 
+# Define the FastAPI app
+app = FastAPI()
 
-def get_vectorstore_from_url(url):
-    # get the text in document form
+
+# Define the request and response models
+class ChatRequest(BaseModel):
+    url: str = "https://vucar.vn/"
+    message: str
+    chat_history: list = []
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    chat_history: list
+
+
+# Define utility functions
+def get_vectorstore_from_url(url: str) -> Chroma:
     loader = WebBaseLoader(url)
     document = loader.load()
-    # split the document into chunks
     text_splitter = RecursiveCharacterTextSplitter()
     document_chunks = text_splitter.split_documents(document)
-
-    # create a vectorstore from the chunks
     vector_store = Chroma.from_documents(document_chunks, OpenAIEmbeddings())
-
     return vector_store
 
 
-def get_context_retriever_chain(vector_store):
-    llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.0, max_tokens=100)
-
+def get_context_retriever_chain(vector_store: Chroma):
+    llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.0, max_tokens=1000)
     retriever = vector_store.as_retriever()
-
     prompt = ChatPromptTemplate.from_messages(
         [
             MessagesPlaceholder(variable_name="chat_history"),
@@ -46,15 +53,12 @@ def get_context_retriever_chain(vector_store):
             ),
         ]
     )
-
     retriever_chain = create_history_aware_retriever(llm, retriever, prompt)
     return retriever_chain
 
 
-def get_conversational_rag_chain(retriever_chain):
-
-    llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.0, max_tokens=100)
-
+def get_conversational_rag_chain(retriever_chain: callable):
+    llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.0, max_tokens=1000)
     prompt = ChatPromptTemplate.from_messages(
         [
             (
@@ -65,56 +69,36 @@ def get_conversational_rag_chain(retriever_chain):
             ("user", "{input}"),
         ]
     )
-
     stuff_documents_chain = create_stuff_documents_chain(llm, prompt)
-
     return create_retrieval_chain(retriever_chain, stuff_documents_chain)
 
 
-def get_response(user_input):
-    retriever_chain = get_context_retriever_chain(st.session_state.vector_store)
+def get_response(vector_store, user_input, chat_history):
+    retriever_chain = get_context_retriever_chain(vector_store)
     conversation_rag_chain = get_conversational_rag_chain(retriever_chain)
-
     response = conversation_rag_chain.invoke(
-        {"chat_history": st.session_state.chat_history, "input": user_input}
+        {"chat_history": chat_history, "input": user_input}
     )
-
     return response["answer"]
 
 
-# app config
-st.set_page_config(page_title="Chat with websites", page_icon="🤖")
-st.title("Chat with websites")
+# API endpoints
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    try:
+        vector_store = get_vectorstore_from_url(request.url)
+        response_text = get_response(
+            vector_store, request.message, request.chat_history
+        )
+        request.chat_history.append(HumanMessage(content=request.message))
+        request.chat_history.append(AIMessage(content=response_text))
+        return ChatResponse(answer=response_text, chat_history=request.chat_history)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-# sidebar
-with st.sidebar:
-    st.header("Settings")
-    website_url = st.text_input("Website URL")
 
-if website_url is None or website_url == "":
-    st.info("Please enter a website URL")
+# Run the FastAPI app with Uvicorn
+if __name__ == "__main__":
+    import uvicorn
 
-else:
-    # session state
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = [
-            AIMessage(content="Hello, I am a bot. How can I help you?"),
-        ]
-    if "vector_store" not in st.session_state:
-        st.session_state.vector_store = get_vectorstore_from_url(website_url)
-
-    # user input
-    user_query = st.chat_input("Type your message here...")
-    if user_query is not None and user_query != "":
-        response = get_response(user_query)
-        st.session_state.chat_history.append(HumanMessage(content=user_query))
-        st.session_state.chat_history.append(AIMessage(content=response))
-
-    # conversation
-    for message in st.session_state.chat_history:
-        if isinstance(message, AIMessage):
-            with st.chat_message("AI"):
-                st.write(message.content)
-        elif isinstance(message, HumanMessage):
-            with st.chat_message("Human"):
-                st.write(message.content)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
